@@ -390,6 +390,26 @@ class TestProcessOrderBatch:
         assert batch_result.results[1].status == OrderStatus.FAILED
         assert batch_result.results[1].message_v1 == "Missing sold-to party in IDoc"
 
+    def test_creator_exception_yields_status_51_and_isolates_batch(self, valid_order):
+        """A raising target system is treated like an 'A' return: status 51, batch continues."""
+
+        def boom(payload):
+            raise RuntimeError("target timeout")
+
+        messages = [
+            InboundOrderMessage(message_id="A", order=valid_order),
+            InboundOrderMessage(message_id="B", order=valid_order),
+        ]
+        first = process_single_order(messages[0], create_order=boom)
+        assert first.status == OrderStatus.FAILED
+        assert first.idoc_status == "51"
+        assert first.message_type == "E"
+        assert first.error_messages == ["target timeout"]
+
+        batch = process_order_batch(messages, create_order=boom)
+        assert batch.total_processed == 2
+        assert [r.idoc_status for r in batch.results] == ["51", "51"]
+
     def test_control_record_filter(self, valid_order):
         """ABAP: LOOP AT idoc_contrl WHERE mestyp = 'ORDERS' AND status = '64'."""
         messages = [

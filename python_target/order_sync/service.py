@@ -309,7 +309,13 @@ def process_single_order(
     payload = map_to_bapi_payload(order)
 
     # Replaces: CALL FUNCTION 'BAPI_SALESORDER_CREATEFROMDAT2'
-    creation = create_order(payload)
+    # A transport/target failure is treated like an aborting ('A') return so the
+    # IDoc gets status 51 and the rest of the batch keeps processing.
+    try:
+        creation = create_order(payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Order creation raised for message %s", message.message_id)
+        creation = OrderCreationResult(messages=[BapiReturn(type="A", message=str(exc))])
 
     # ABAP: LOOP AT lt_return WHERE type CA 'EA'. lv_has_error = abap_true.
     error_returns = [m for m in creation.messages if m.type in BAPI_ERROR_TYPES]

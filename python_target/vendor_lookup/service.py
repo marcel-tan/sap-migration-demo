@@ -56,10 +56,6 @@ class AuthorizationError(Exception):
         super().__init__(f"Authorization failed for company code {company_code}")
 
 
-def _allow_all(company_code: str, activity: str) -> bool:
-    return True
-
-
 def check_authorization(
     company_code: str,
     is_authorized: AuthorizationChecker,
@@ -96,7 +92,7 @@ def lookup_vendor(
     request: VendorLookupRequest,
     vendor_data: Optional[dict],
     po_data: list[dict],
-    is_authorized: AuthorizationChecker = _allow_all,
+    is_authorized: AuthorizationChecker,
 ) -> VendorLookupResponse:
     """Main lookup logic — replaces the ABAP function module body.
 
@@ -105,7 +101,8 @@ def lookup_vendor(
         vendor_data:   Vendor master record from data warehouse.
                        None if vendor not found.
         po_data:       Purchase order line items from data warehouse.
-        is_authorized: (company_code, activity) -> bool; replaces AUTHORITY-CHECK.
+        is_authorized: (company_code, activity) -> bool; replaces AUTHORITY-CHECK
+                       F_LFA1_BUK. Required so no caller can skip the check.
 
     Returns:
         VendorLookupResponse with vendor details and PO history.
