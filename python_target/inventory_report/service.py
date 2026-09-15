@@ -12,8 +12,8 @@ Migration notes:
 - Selection screen → query parameters / request body
 """
 
-from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from datetime import UTC, date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from .models import (
@@ -23,6 +23,11 @@ from .models import (
     InventoryReportSummary,
     StockStatus,
 )
+
+# ABAP: stock_value = total_stock * 10. " Placeholder unit cost
+#       currency = 'USD'.
+PLACEHOLDER_UNIT_COST = Decimal("10")
+REPORT_CURRENCY = "USD"
 
 
 def calculate_stock_status(
@@ -67,10 +72,18 @@ def calculate_stock_percentage(
     """Stock level as percentage of reorder point.
 
     Matches ABAP: IF minbe > 0 THEN (labst / minbe) * 100 ELSE 100.
+    Result is rounded to 2 decimals like the ABAP `TYPE p DECIMALS 2` field.
     """
     if reorder_point > 0:
-        return (available_stock / reorder_point) * 100
-    return Decimal("100")
+        pct = (available_stock / reorder_point) * 100
+    else:
+        pct = Decimal("100")
+    return pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def calculate_stock_value(total_stock: Decimal) -> Decimal:
+    """Matches ABAP: stock_value = total_stock * 10 (placeholder unit cost)."""
+    return total_stock * PLACEHOLDER_UNIT_COST
 
 
 def filter_by_status(
@@ -147,8 +160,7 @@ def generate_inventory_report(
         pct = calculate_stock_percentage(available, reorder)
 
         # Stock value — simplified (production would join MBEW for moving avg price)
-        unit_cost = Decimal(str(row.get("unit_cost", 10)))
-        stock_value = total * unit_cost
+        stock_value = calculate_stock_value(total)
 
         item = InventoryItem(
             material_number=row["material_number"],
@@ -166,7 +178,7 @@ def generate_inventory_report(
             stock_status=status,
             stock_percentage=pct,
             last_receipt_date=last_receipt,
-            currency=row.get("currency", "USD"),
+            currency=REPORT_CURRENCY,
             stock_value=stock_value,
         )
         items.append(item)

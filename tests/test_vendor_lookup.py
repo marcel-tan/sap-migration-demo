@@ -219,6 +219,95 @@ class TestLookupVendor:
         dates = [item.po_date for item in response.po_history]
         assert dates == sorted(dates, reverse=True)
 
+    def test_authorization_failed(self, sample_vendor_data, sample_po_data):
+        """ABAP: AUTHORITY-CHECK 'F_LFA1_BUK' ... IF sy-subrc <> 0. ev_return_code = 2. RAISE authorization_failed."""
+        request = VendorLookupRequest(vendor_number="0000001000", company_code="2000")
+
+        def only_1000(company_code: str, activity: str) -> bool:
+            return company_code == "1000" and activity == "03"
+
+        with pytest.raises(AuthorizationError) as exc_info:
+            lookup_vendor(request, sample_vendor_data, sample_po_data, is_authorized=only_1000)
+
+        assert exc_info.value.return_code == 2
+        assert str(exc_info.value) == "Authorization failed for company code 2000"
+
+    def test_authorization_checked_before_vendor_lookup(self):
+        """ABAP: authorization check precedes SELECT SINGLE FROM lfa1."""
+        request = VendorLookupRequest(vendor_number="9999999999")
+        with pytest.raises(AuthorizationError):
+            lookup_vendor(request, None, [], is_authorized=lambda c, a: False)
+
+    def test_vendor_not_found_return_code(self):
+        """ABAP: ev_return_code = 1. ev_return_msg = |Vendor { iv_lifnr } not found|."""
+        with pytest.raises(VendorNotFoundError) as exc_info:
+            lookup_vendor(VendorLookupRequest(vendor_number="9999999999"), None, [])
+        assert exc_info.value.return_code == 1
+        assert str(exc_info.value) == "Vendor 9999999999 not found"
+
+    def test_po_date_boundary_inclusive(self, sample_vendor_data, sample_po_data):
+        """ABAP: WHERE h~bedat >= lv_date_from (boundary date included)."""
+        request = VendorLookupRequest(
+            vendor_number="0000001000",
+            date_from=date.today() - timedelta(days=90),
+        )
+        response = lookup_vendor(request, sample_vendor_data, sample_po_data)
+        assert len(response.po_history) == 3
+
+        request.date_from = date.today() - timedelta(days=89)
+        response = lookup_vendor(request, sample_vendor_data, sample_po_data)
+        assert len(response.po_history) == 2
+
+    def test_default_date_from_is_365_days(self, sample_vendor_data, sample_po_data):
+        """ABAP: IF iv_date_from IS INITIAL. lv_date_from = sy-datum - 365."""
+        sample_po_data.append(
+            {
+                "po_number": "4500000001",
+                "po_item": "00010",
+                "po_date": (date.today() - timedelta(days=366)).isoformat(),
+                "quantity": 1,
+                "unit_of_measure": "EA",
+                "net_price": 1,
+            }
+        )
+        sample_po_data.append(
+            {
+                "po_number": "4500000002",
+                "po_item": "00010",
+                "po_date": (date.today() - timedelta(days=365)).isoformat(),
+                "quantity": 1,
+                "unit_of_measure": "EA",
+                "net_price": 1,
+            }
+        )
+        request = VendorLookupRequest(vendor_number="0000001000")
+        response = lookup_vendor(request, sample_vendor_data, sample_po_data)
+        assert [i.po_number for i in response.po_history][-1] == "4500000002"
+        assert len(response.po_history) == 4
+
+    def test_deleted_rows_excluded(self, sample_vendor_data, sample_po_data):
+        """ABAP: AND h~loekz = ' ' AND p~loekz = ' '."""
+        sample_po_data[0]["header_deleted"] = True
+        sample_po_data[1]["item_deleted"] = True
+        request = VendorLookupRequest(vendor_number="0000001000")
+        response = lookup_vendor(request, sample_vendor_data, sample_po_data)
+        assert [i.po_number for i in response.po_history] == ["4500001100"]
+
+    def test_limit_applied_after_sort_and_aggregates_use_limited_rows(
+        self, sample_vendor_data, sample_po_data
+    ):
+        """ABAP: ORDER BY bedat DESCENDING UP TO iv_max_pos ROWS; aggregates loop over lt_po_hist."""
+        request = VendorLookupRequest(vendor_number="0000001000", max_po_items=2)
+        response = lookup_vendor(request, sample_vendor_data, sample_po_data)
+
+        assert [i.po_item for i in response.po_history] == ["00010", "00020"]
+        # 100 * 25.50 + 50 * 42.00 (the 90-day-old PO is cut off by the limit)
+        assert response.vendor.total_po_value == Decimal("4650.00")
+        assert response.vendor.open_po_count == 1
+        assert response.return_message == (
+            "Vendor 0000001000 retrieved successfully. 2 PO items returned."
+        )
+
     def test_blocked_vendor_still_returned(self, sample_vendor_data):
         """Vendor with central block is returned (block is informational)."""
         sample_vendor_data["is_blocked"] = True
