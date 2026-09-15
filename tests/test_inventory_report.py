@@ -21,6 +21,7 @@ from python_target.inventory_report.service import (
     build_summary,
     calculate_stock_percentage,
     calculate_stock_status,
+    calculate_stock_value,
     filter_by_status,
     generate_inventory_report,
 )
@@ -127,6 +128,25 @@ class TestCalculateStockPercentage:
     def test_below_reorder(self):
         result = calculate_stock_percentage(Decimal("30"), Decimal("100"))
         assert result == Decimal("30")
+
+    def test_rounded_to_two_decimals(self):
+        """ABAP: stock_pct TYPE p DECIMALS 2 (rounded, not truncated)."""
+        result = calculate_stock_percentage(Decimal("1"), Decimal("3"))
+        assert result == Decimal("33.33")
+        result = calculate_stock_percentage(Decimal("2"), Decimal("3"))
+        assert result == Decimal("66.67")
+
+
+# ---------------------------------------------------------------------------
+# calculate_stock_value — mirrors ABAP placeholder stock value
+# ---------------------------------------------------------------------------
+
+class TestCalculateStockValue:
+
+    def test_placeholder_unit_cost(self):
+        """ABAP: stock_value = total_stock * 10. " Placeholder unit cost."""
+        assert calculate_stock_value(Decimal("215")) == Decimal("2150")
+        assert calculate_stock_value(Decimal("0")) == Decimal("0")
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +260,52 @@ class TestGenerateInventoryReport:
         report = generate_inventory_report(raw_data, filters)
 
         assert report.total_items == 3
-        assert report.summary.critical_count >= 1
+        assert report.summary.critical_count == 2
         # Items sorted: critical first, then by plant
         assert report.items[0].stock_status == StockStatus.CRITICAL
+        assert [i.material_number for i in report.items] == [
+            "MAT-002", "MAT-003", "MAT-001"
+        ]
+
+    def test_total_stock_value_and_currency(self):
+        """ABAP: total_stock = labst + insme + speme;
+        stock_value = total_stock * 10; currency = 'USD' (row values ignored)."""
+        raw_data = [
+            {
+                "material_number": "MAT-001",
+                "plant": "1000",
+                "available_stock": 200,
+                "inspection_stock": 10,
+                "blocked_stock": 5,
+                "reorder_point": 100,
+                "unit_cost": 25,
+                "currency": "EUR",
+            },
+        ]
+        filters = InventoryFilters(show_healthy=True)
+        report = generate_inventory_report(raw_data, filters)
+
+        item = report.items[0]
+        assert item.total_stock == Decimal("215")
+        assert item.stock_value == Decimal("2150")
+        assert item.currency == "USD"
+
+    def test_sort_status_then_plant(self):
+        """ABAP ALV: add_sort STOCK_STATUS position 1, WERKS position 2 (both up)."""
+        raw_data = [
+            {"material_number": "H-2", "plant": "2000", "available_stock": 500, "reorder_point": 100},
+            {"material_number": "C-3", "plant": "3000", "available_stock": 0, "reorder_point": 100},
+            {"material_number": "W-1", "plant": "1000", "available_stock": 120, "reorder_point": 100},
+            {"material_number": "C-1", "plant": "1000", "available_stock": 10, "reorder_point": 100},
+            {"material_number": "H-1", "plant": "1000", "available_stock": 500, "reorder_point": 100},
+        ]
+        filters = InventoryFilters(
+            show_critical=True, show_warning=True, show_healthy=True
+        )
+        report = generate_inventory_report(raw_data, filters)
+        assert [i.material_number for i in report.items] == [
+            "C-1", "C-3", "W-1", "H-1", "H-2"
+        ]
 
     def test_report_filters_correctly(self):
         """Verify status filter excludes healthy items by default."""

@@ -14,7 +14,7 @@ Migration notes:
 
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from .models import (
     PurchaseOrderItem,
@@ -24,8 +24,22 @@ from .models import (
 )
 
 
+# ABAP: EV_RETURN_CODE  0=OK, 1=not found, 2=error
+RETURN_CODE_OK = 0
+RETURN_CODE_NOT_FOUND = 1
+RETURN_CODE_ERROR = 2
+
+# ABAP: AUTHORITY-CHECK OBJECT 'F_LFA1_BUK' ID 'BUKRS' FIELD iv_bukrs ID 'ACTVT' FIELD '03'.
+AUTH_OBJECT = "F_LFA1_BUK"
+AUTH_ACTIVITY_DISPLAY = "03"
+
+AuthorizationChecker = Callable[[str, str], bool]
+
+
 class VendorNotFoundError(Exception):
-    """Replaces ABAP RAISE vendor_not_found."""
+    """Replaces ABAP RAISE vendor_not_found (ev_return_code = 1)."""
+
+    return_code = RETURN_CODE_NOT_FOUND
 
     def __init__(self, vendor_number: str) -> None:
         self.vendor_number = vendor_number
@@ -33,11 +47,25 @@ class VendorNotFoundError(Exception):
 
 
 class AuthorizationError(Exception):
-    """Replaces ABAP RAISE authorization_failed."""
+    """Replaces ABAP RAISE authorization_failed (ev_return_code = 2)."""
+
+    return_code = RETURN_CODE_ERROR
 
     def __init__(self, company_code: str) -> None:
         self.company_code = company_code
         super().__init__(f"Authorization failed for company code {company_code}")
+
+
+def check_authorization(
+    company_code: str,
+    is_authorized: AuthorizationChecker,
+) -> None:
+    """AUTHORITY-CHECK OBJECT 'F_LFA1_BUK' ID 'BUKRS' FIELD iv_bukrs ID 'ACTVT' FIELD '03'.
+
+    ABAP: IF sy-subrc <> 0. ev_return_code = 2. RAISE authorization_failed.
+    """
+    if not is_authorized(company_code, AUTH_ACTIVITY_DISPLAY):
+        raise AuthorizationError(company_code)
 
 
 def calculate_po_aggregates(
@@ -64,21 +92,28 @@ def lookup_vendor(
     request: VendorLookupRequest,
     vendor_data: Optional[dict],
     po_data: list[dict],
+    is_authorized: AuthorizationChecker,
 ) -> VendorLookupResponse:
     """Main lookup logic — replaces the ABAP function module body.
 
     Args:
-        request:     Lookup parameters (vendor number, company code, etc.)
-        vendor_data: Vendor master record from data warehouse.
-                     None if vendor not found.
-        po_data:     Purchase order line items from data warehouse.
+        request:       Lookup parameters (vendor number, company code, etc.)
+        vendor_data:   Vendor master record from data warehouse.
+                       None if vendor not found.
+        po_data:       Purchase order line items from data warehouse.
+        is_authorized: (company_code, activity) -> bool; replaces AUTHORITY-CHECK
+                       F_LFA1_BUK. Required so no caller can skip the check.
 
     Returns:
         VendorLookupResponse with vendor details and PO history.
 
     Raises:
+        AuthorizationError:  If the caller lacks F_LFA1_BUK display for company_code.
         VendorNotFoundError: If vendor_data is None.
     """
+    # Authorization check runs before any data access — ABAP: RAISE authorization_failed.
+    check_authorization(request.company_code, is_authorized)
+
     # Vendor not found check — maps to ABAP: IF sy-subrc <> 0. RAISE vendor_not_found.
     if vendor_data is None:
         raise VendorNotFoundError(request.vendor_number)
@@ -114,7 +149,11 @@ def lookup_vendor(
             po_date = date.fromisoformat(po_date)
 
         # Apply date filter (matches ABAP: WHERE h~bedat >= lv_date_from)
-        if po_date is not None and po_date < date_from:
+        if po_date is None or po_date < date_from:
+            continue
+
+        # ABAP: AND h~loekz = ' ' AND p~loekz = ' ' (header/item not deleted)
+        if row.get("header_deleted", False) or row.get("item_deleted", False):
             continue
 
         item = PurchaseOrderItem(
@@ -144,7 +183,7 @@ def lookup_vendor(
     return VendorLookupResponse(
         vendor=vendor,
         po_history=po_items,
-        return_code=0,
+        return_code=RETURN_CODE_OK,
         return_message=(
             f"Vendor {request.vendor_number} retrieved successfully. "
             f"{len(po_items)} PO items returned."
