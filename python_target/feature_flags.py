@@ -179,6 +179,7 @@ def resolve_flag(
             mode = _parse_mode(flag, rule.get("mode"))
             if mode is not None:
                 return FlagDecision(flag, mode, f"{source}:rule[{index}]", attrs)
+            return FlagDecision(flag, legacy, f"{source}:rule[{index}]:invalid_mode", attrs)
 
     if "default" in flag_config:
         mode = _parse_mode(flag, flag_config["default"])

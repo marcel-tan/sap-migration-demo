@@ -69,6 +69,21 @@ class TestResolveFlag:
         assert (canary.mode, canary.reason) == (VendorLookupFlagMode.PYTHON, "config:rule[0]")
         assert (same_bukrs.mode, same_bukrs.reason) == (VendorLookupFlagMode.SHADOW, "config:rule[1]")
 
+    def test_resolve_flag_matching_invalid_mode_falls_back_to_legacy(self):
+        config = {
+            VENDOR_LOOKUP: {
+                "rules": [{"mode": "shadw", "match": {"bukrs": "1000"}}],
+                "default": "python",
+            }
+        }
+
+        matched = resolve_flag(VENDOR_LOOKUP, {"bukrs": "1000"}, config=config, env={})
+        unmatched = resolve_flag(VENDOR_LOOKUP, {"bukrs": "2000"}, config=config, env={})
+
+        assert matched.mode == VendorLookupFlagMode.ABAP
+        assert matched.reason == "config:rule[0]:invalid_mode"
+        assert unmatched.mode == VendorLookupFlagMode.PYTHON
+
     def test_resolve_flag_list_attribute_requires_all_values_in_cohort(self):
         config = {INVENTORY_REPORT: {"rules": [{"mode": "python", "match": {"werks": ["1000", "2000"]}}]}}
         assert resolve_flag(INVENTORY_REPORT, {"werks": ["1000", "2000"]}, config=config).mode == InventoryReportFlagMode.PYTHON
