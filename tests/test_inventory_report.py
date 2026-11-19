@@ -314,6 +314,20 @@ def _recorded_baseline(raw_data, filters):
 
 class TestRouteInventoryReport:
 
+    def test_diff_inventory_reports_rounds_stock_percentage_half_up(
+        self, routing_raw_data, routing_filters
+    ):
+        report = generate_inventory_report(routing_raw_data, routing_filters)
+        item = report.items[0]
+        legacy = report.model_copy(update={
+            "items": [item.model_copy(update={"stock_percentage": Decimal("100.01")})]
+        })
+        python = report.model_copy(update={
+            "items": [item.model_copy(update={"stock_percentage": Decimal("100.005")})]
+        })
+
+        assert inventory_service.diff_inventory_reports(legacy, python).clean
+
     def test_route_inventory_report_defaults_to_abap(self, routing_raw_data, routing_filters, monkeypatch):
         legacy = _recorded_baseline(routing_raw_data, routing_filters)
         monkeypatch.setattr(inventory_service, "generate_inventory_report", _fail_if_called)

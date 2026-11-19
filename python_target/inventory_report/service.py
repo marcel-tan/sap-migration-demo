@@ -13,7 +13,7 @@ Migration notes:
 """
 
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Callable, Optional
 
 from ..feature_flags import (
@@ -246,8 +246,8 @@ def diff_inventory_reports(
             diff.differences.append(
                 FieldDiff(key, "stock_status", old.stock_status.value, new.stock_status.value)
             )
-        old_pct = old.stock_percentage.quantize(_PCT_PRECISION)
-        new_pct = new.stock_percentage.quantize(_PCT_PRECISION)
+        old_pct = old.stock_percentage.quantize(_PCT_PRECISION, rounding=ROUND_HALF_UP)
+        new_pct = new.stock_percentage.quantize(_PCT_PRECISION, rounding=ROUND_HALF_UP)
         if old_pct != new_pct:
             diff.differences.append(FieldDiff(key, "stock_percentage", old_pct, new_pct))
         if is_stale_downgrade(old) != is_stale_downgrade(new):
