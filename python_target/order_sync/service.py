@@ -17,11 +17,23 @@ Migration notes:
 """
 
 import logging
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Iterator, Optional
 
+from ..feature_flags import (
+    ORDER_SYNC,
+    FieldDiff,
+    LegacyHandlerRequired,
+    OrderSyncFlagMode,
+    RoutedResult,
+    ShadowDiff,
+    emit_flag_event,
+    resolve_flag,
+)
 from .models import (
     InboundOrderMessage,
     OrderHeader,
@@ -125,8 +137,8 @@ def parse_idoc_to_order(raw_segments: list[dict]) -> OrderHeader:
         elif seg_type == "E1EDK03":
             qualifier = seg.get("IDDAT", "")
             date_val = seg.get("DATUM")
-            if date_val and isinstance(date_val, str):
-                date_val = date.fromisoformat(date_val)
+            if isinstance(date_val, str):
+                date_val = None if not date_val.strip("0") else date.fromisoformat(date_val)
             if qualifier == "012":
                 header.requested_delivery_date = date_val
             elif qualifier == "022":
@@ -174,8 +186,12 @@ def parse_idoc_to_order(raw_segments: list[dict]) -> OrderHeader:
     return header
 
 
+OrderCreator = Callable[[OrderHeader], str]
+
+
 def process_single_order(
     message: InboundOrderMessage,
+    order_creator: Optional[OrderCreator] = None,
 ) -> OrderSyncResult:
     """Process a single inbound order message.
 
@@ -208,7 +224,7 @@ def process_single_order(
     # Simulate order creation — in production, this calls the target system
     # Replaces: CALL FUNCTION 'BAPI_SALESORDER_CREATEFROMDAT2'
     try:
-        order_number = _create_order_in_target_system(order)
+        order_number = (order_creator or _create_order_in_target_system)(order)
 
         logger.info(
             "Order %s created for message %s (sold-to: %s, %d items)",
@@ -275,3 +291,150 @@ def _create_order_in_target_system(order: OrderHeader) -> str:
     # Generate a 10-digit order number (similar to SAP VBELN format)
     order_number = str(uuid.uuid4().int)[:10].zfill(10)
     return order_number
+
+
+# ---------------------------------------------------------------------------
+# Feature-flag routing (IDoc/ABAP → validate_only → Python)
+# ---------------------------------------------------------------------------
+
+# Legacy path: hands the IDoc to the ABAP inbound function Z_IDOC_ORDER_SYNC.
+OrderLegacyHandler = Callable[[InboundOrderMessage], OrderSyncResult]
+
+IDOC_STATUS = {OrderStatus.CREATED: "53", OrderStatus.FAILED: "51"}
+
+
+class InMemoryIdempotencyStore:
+    """Created orders keyed by IDoc DOCNUM, shared by the ABAP and Python paths.
+
+    Production would back this with a DB table with a unique key on DOCNUM.
+    Only successful creations are stored, so a status-51 IDoc can be reprocessed.
+    """
+
+    def __init__(self) -> None:
+        self._results: dict[str, OrderSyncResult] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    @contextmanager
+    def lock(self, docnum: str) -> Iterator[None]:
+        with self._guard:
+            doc_lock = self._locks.setdefault(docnum, threading.Lock())
+        with doc_lock:
+            yield
+
+    def get(self, docnum: str) -> Optional[OrderSyncResult]:
+        return self._results.get(docnum)
+
+    def put(self, docnum: str, result: OrderSyncResult) -> None:
+        self._results[docnum] = result
+
+
+_default_store = InMemoryIdempotencyStore()
+
+
+def _python_prediction(message: InboundOrderMessage) -> OrderSyncResult:
+    """What the Python path would do, without calling order creation."""
+    errors = validate_order(message.order)
+    return OrderSyncResult(
+        message_id=message.message_id,
+        status=OrderStatus.FAILED if errors else OrderStatus.VALIDATED,
+        error_messages=errors,
+    )
+
+
+def diff_order_outcomes(legacy: OrderSyncResult, predicted: OrderSyncResult) -> ShadowDiff:
+    """Compare the ABAP IDoc outcome with the Python validation prediction."""
+    diff = ShadowDiff()
+    legacy_ok = legacy.status == OrderStatus.CREATED
+    python_ok = predicted.status == OrderStatus.VALIDATED
+    if legacy_ok != python_ok:
+        diff.differences.append(
+            FieldDiff(
+                legacy.message_id,
+                "idoc_status",
+                IDOC_STATUS.get(legacy.status),
+                "53" if python_ok else "51",
+            )
+        )
+    return diff
+
+
+def route_order_message(
+    message: InboundOrderMessage,
+    *,
+    legacy_handler: Optional[OrderLegacyHandler] = None,
+    order_creator: Optional[OrderCreator] = None,
+    idempotency_store: Optional[InMemoryIdempotencyStore] = None,
+    flags_config: Optional[dict] = None,
+    env: Optional[dict] = None,
+) -> RoutedResult[OrderSyncResult]:
+    """Process one inbound order according to the order_sync flag.
+
+    Targeting: ``docnum`` (message_id), ``sndprn`` (sender partner) and ``kunnr`` (sold-to).
+    VALIDATE_ONLY lets ABAP create the order and records what Python would have done.
+    Every path is idempotent on DOCNUM: a replayed IDoc returns the stored result.
+    """
+    store = idempotency_store or _default_store
+    docnum = message.message_id
+    attributes = {
+        "docnum": docnum,
+        "sndprn": message.sender_system,
+        "kunnr": message.order.sold_to_party,
+    }
+    decision = resolve_flag(
+        ORDER_SYNC,
+        {k: v for k, v in attributes.items() if v},
+        config=flags_config,
+        env=env,
+    )
+
+    with store.lock(docnum):
+        existing = store.get(docnum)
+        if existing is not None:
+            routed = RoutedResult(
+                existing, decision, "idempotency_store", details={"replayed": True}
+            )
+        elif decision.mode == OrderSyncFlagMode.PYTHON:
+            result = process_single_order(message, order_creator=order_creator)
+            routed = RoutedResult(result, decision, "python")
+        else:
+            if legacy_handler is None:
+                raise LegacyHandlerRequired(ORDER_SYNC, decision.mode)
+            result = legacy_handler(message)
+            routed = RoutedResult(result, decision, "abap")
+            if decision.mode == OrderSyncFlagMode.VALIDATE_ONLY:
+                try:
+                    predicted = _python_prediction(message)
+                    routed.diff = diff_order_outcomes(result, predicted)
+                    routed.details["would_have"] = {
+                        "action": "create_order" if predicted.status == OrderStatus.VALIDATED else "reject",
+                        "idoc_status": "53" if predicted.status == OrderStatus.VALIDATED else "51",
+                        "sold_to": message.order.sold_to_party,
+                        "item_count": len(message.order.items),
+                        "errors": predicted.error_messages,
+                    }
+                except Exception as exc:  # shadow path must never break the legacy path
+                    routed.diff = ShadowDiff(python_error=repr(exc))
+
+        if routed.served_by != "idempotency_store" and routed.result.status == OrderStatus.CREATED:
+            store.put(docnum, routed.result)
+
+    routed.details["idoc_status"] = IDOC_STATUS.get(routed.result.status)
+    emit_flag_event(routed)
+    return routed
+
+
+def route_inbound_idoc(
+    docnum: str,
+    raw_segments: list[dict],
+    *,
+    sender_partner: Optional[str] = None,
+    **kwargs,
+) -> RoutedResult[OrderSyncResult]:
+    """Parse raw ORDERS05 segments, then route via ``route_order_message``."""
+    message = InboundOrderMessage(
+        message_id=docnum,
+        sender_system=sender_partner,
+        order=parse_idoc_to_order(raw_segments),
+    )
+    return route_order_message(message, **kwargs)

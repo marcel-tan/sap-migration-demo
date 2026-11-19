@@ -135,6 +135,16 @@ def test_<function_name>_<scenario>():
 - [ ] Error handling covers all ABAP SY-SUBRC / MESSAGE paths
 - [ ] Comments reference original ABAP code for traceability
 
+### Step 7: Roll Out Behind a Feature Flag
+
+- [ ] Add the object to `python_target/feature_flags.py` with legacy as the default mode
+- [ ] Add a router that takes an injectable `legacy_handler` and emits `emit_flag_event()`
+- [ ] Run `shadow` (or `validate_only` for inbound IDocs) until `diff.clean` holds for the agreed window
+- [ ] Move a canary cohort (`bukrs`, `werks`, `lifnr`, `docnum`, `sndprn`) to `python`, then go global
+- [ ] Remove the flag, router and legacy handler once ABAP is decommissioned
+
+See the "Feature-flag rollout" section in `README.md`.
+
 ---
 
 ## Migration Patterns by Object Type

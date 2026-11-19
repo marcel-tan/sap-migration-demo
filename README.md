@@ -31,6 +31,7 @@ sap-migration-demo/
 │   └── z_idoc_order_sync.abap          ← IDoc processing function
 │
 ├── python_target/                      ← Migrated Python services
+│   ├── feature_flags.py                ← Per-object rollout flags (ABAP → shadow → Python)
 │   ├── inventory_report/
 │   │   ├── models.py                   ← Pydantic models (from ABAP TYPEs)
 │   │   └── service.py                  ← Business logic (from ABAP FORMs)
@@ -42,6 +43,7 @@ sap-migration-demo/
 │       └── service.py
 │
 └── tests/                              ← Functional equivalence tests
+    ├── test_feature_flags.py
     ├── test_inventory_report.py
     ├── test_vendor_lookup.py
     └── test_order_sync.py
@@ -97,7 +99,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-Expected output: **25+ tests passing**, covering:
+Expected output: **75+ tests passing**, covering:
 - Stock status calculation (all threshold boundaries)
 - Stock percentage computation
 - Status filtering (critical/warning/healthy checkboxes)
@@ -109,6 +111,45 @@ Expected output: **25+ tests passing**, covering:
 - Order validation (6 validation rules)
 - Single order processing (success + failure)
 - Batch processing with mixed results
+- Feature-flag resolution, cohort targeting, shadow diffs, `validate_only`, and idempotent IDoc replay
+
+---
+
+## Feature-flag rollout
+
+No big-bang cutover: each migrated object has its own flag in [`python_target/feature_flags.py`](python_target/feature_flags.py) and moves through the same stages independently.
+
+| Flag | Router | Modes (default first) | Scoping attributes |
+|---|---|---|---|
+| `inventory_report` | `route_inventory_report()` | `abap` → `shadow` → `python` | `werks` (every requested plant must be in the cohort), `bukrs` |
+| `vendor_lookup` | `route_vendor_lookup()` | `abap` → `shadow` → `python` | `bukrs`, `lifnr` |
+| `order_sync` | `route_order_message()` / `route_inbound_idoc()` | `idoc_abap` → `validate_only` → `python` | `docnum`, `sndprn` (sender partner), `kunnr` (sold-to) |
+
+**Modes**
+- `abap` / `idoc_abap` (default): the injected `legacy_handler` (the RFC/report/IDoc inbound call, or a recorded baseline) serves the result. Nothing changes until a flag is set.
+- `shadow`: both paths run; the legacy result is returned and a structured diff is logged. Inventory compares `stock_status`, `stock_percentage` (2 decimals, like ABAP packed fields) and stale-receipt downgrades. Vendor compares `ES_VENDOR` fields, `ET_PO_HISTORY` rows and return code/message, including `vendor_not_found` (1) and `authorization_failed` (2). A Python exception is recorded in the diff, never raised.
+- `validate_only` (order sync): ABAP still creates the order; Python parses and runs `validate_order()` without calling order creation, and logs what it would have done (`create_order`/`reject`, IDoc status 53/51).
+- `python`: the Python service serves the result.
+
+**Idempotency**: order sync keys every path on `docnum`. A created order is stored (ABAP or Python), so a retried IDoc or a flag flip mid-processing returns the stored result instead of creating a duplicate. Failed (51) IDocs are not stored and can be reprocessed.
+
+**Configuring a flag** (explicit `flags_config` dict wins over env vars; invalid modes fall back to legacy):
+
+```bash
+FF_VENDOR_LOOKUP_MODE=shadow          # global
+FF_VENDOR_LOOKUP_MODE=python          # or a canary cohort:
+FF_VENDOR_LOOKUP_BUKRS=1000,2000
+```
+
+```python
+flags_config = {"order_sync": {"default": "validate_only",
+                               "rules": [{"mode": "python", "match": {"sndprn": ["EDI-GATEWAY"]}}]}}
+route_order_message(message, legacy_handler=call_idoc_inbound, flags_config=flags_config)
+```
+
+**Observability**: every routed call logs one JSON `feature_flag.route` event on the `python_target.feature_flags` logger (also attached as `record.flag_event`) with `flag`, `mode`, `reason`, `attributes`, `served_by` and `diff` (`clean`, `difference_count`, `differences`, `python_error`). Diffs log at WARNING, so "clean shadow traffic" is a count of events where `diff.clean` is true.
+
+**Progression per object**: `legacy` → `shadow` / `validate_only` (until diffs are clean for the agreed window) → `python` for a canary cohort → `python` globally → remove the flag, router and legacy handler.
 
 ---
 
