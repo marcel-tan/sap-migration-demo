@@ -8,9 +8,15 @@ piece of ABAP logic with comments referencing the original code.
 
 from datetime import date, timedelta
 from decimal import Decimal
+import logging
 
 import pytest
 
+from python_target.feature_flags import (
+    InventoryReportFlagMode,
+    LegacyHandlerRequired,
+)
+from python_target.inventory_report import service as inventory_service
 from python_target.inventory_report.models import (
     InventoryFilters,
     InventoryItem,
@@ -23,6 +29,7 @@ from python_target.inventory_report.service import (
     calculate_stock_status,
     filter_by_status,
     generate_inventory_report,
+    route_inventory_report,
 )
 
 
@@ -272,3 +279,159 @@ class TestGenerateInventoryReport:
         report = generate_inventory_report([], filters)
         assert report.total_items == 0
         assert report.items == []
+
+
+# ---------------------------------------------------------------------------
+# route_inventory_report — feature-flag routing (abap → shadow → python)
+# ---------------------------------------------------------------------------
+
+FLAG_LOGGER = "python_target.feature_flags"
+
+
+@pytest.fixture()
+def routing_raw_data() -> list[dict]:
+    today = date.today()
+    return [
+        {"material_number": "MAT-001", "plant": "1000", "storage_location": "0001",
+         "available_stock": 200, "reorder_point": 100, "last_receipt_date": today.isoformat()},
+        {"material_number": "MAT-002", "plant": "1000", "storage_location": "0001",
+         "available_stock": 200, "reorder_point": 100,
+         "last_receipt_date": (today - timedelta(days=120)).isoformat()},
+        {"material_number": "MAT-003", "plant": "1000", "storage_location": "0001",
+         "available_stock": 80, "reorder_point": 100, "last_receipt_date": today.isoformat()},
+    ]
+
+
+@pytest.fixture()
+def routing_filters() -> InventoryFilters:
+    return InventoryFilters(plants=["1000"], show_critical=True, show_warning=True, show_healthy=True)
+
+
+def _recorded_baseline(raw_data, filters):
+    """Stands in for the ABAP ALV output; identical to Python unless mutated."""
+    return generate_inventory_report(raw_data, filters)
+
+
+class TestRouteInventoryReport:
+
+    def test_route_inventory_report_defaults_to_abap(self, routing_raw_data, routing_filters, monkeypatch):
+        legacy = _recorded_baseline(routing_raw_data, routing_filters)
+        monkeypatch.setattr(inventory_service, "generate_inventory_report", _fail_if_called)
+
+        routed = route_inventory_report(
+            routing_raw_data, routing_filters, legacy_handler=lambda *_: legacy, env={}
+        )
+
+        assert routed.decision.mode == InventoryReportFlagMode.ABAP
+        assert routed.served_by == "abap"
+        assert routed.result is legacy
+        assert routed.diff is None
+
+    def test_route_inventory_report_shadow_returns_legacy_and_logs_diff(
+        self, routing_raw_data, routing_filters, caplog
+    ):
+        legacy = _recorded_baseline(routing_raw_data, routing_filters)
+        mat1 = next(i for i in legacy.items if i.material_number == "MAT-001")
+        mat1.stock_status = StockStatus.WARNING
+        mat1.stock_percentage = Decimal("199.5")
+
+        with caplog.at_level(logging.INFO, logger=FLAG_LOGGER):
+            routed = route_inventory_report(
+                routing_raw_data, routing_filters,
+                legacy_handler=lambda *_: legacy,
+                env={"FF_INVENTORY_REPORT_MODE": "shadow"},
+            )
+
+        assert routed.result is legacy
+        assert routed.served_by == "abap"
+        fields = {(d.key, d.field) for d in routed.diff.differences}
+        assert fields == {
+            ("MAT-001/1000/0001", "stock_status"),
+            ("MAT-001/1000/0001", "stock_percentage"),
+            ("MAT-001/1000/0001", "stale_downgrade"),
+        }
+        event = caplog.records[-1].flag_event
+        assert event["mode"] == "shadow"
+        assert event["diff"]["clean"] is False
+        assert event["diff"]["difference_count"] == 3
+
+    def test_route_inventory_report_shadow_clean_when_paths_agree(
+        self, routing_raw_data, routing_filters, caplog
+    ):
+        with caplog.at_level(logging.INFO, logger=FLAG_LOGGER):
+            routed = route_inventory_report(
+                routing_raw_data, routing_filters,
+                legacy_handler=_recorded_baseline,
+                env={"FF_INVENTORY_REPORT_MODE": "shadow"},
+            )
+
+        assert routed.diff.clean
+        assert caplog.records[-1].flag_event["diff"]["clean"] is True
+
+    def test_route_inventory_report_shadow_detects_missing_stale_downgrade(
+        self, routing_raw_data, routing_filters
+    ):
+        legacy = _recorded_baseline(routing_raw_data, routing_filters)
+        stale = next(i for i in legacy.items if i.material_number == "MAT-002")
+        assert inventory_service.is_stale_downgrade(stale)
+        stale.stock_status = StockStatus.HEALTHY
+
+        routed = route_inventory_report(
+            routing_raw_data, routing_filters,
+            legacy_handler=lambda *_: legacy,
+            env={"FF_INVENTORY_REPORT_MODE": "shadow"},
+        )
+
+        diffs = {d.field: d for d in routed.diff.differences}
+        assert diffs["stale_downgrade"].legacy is False
+        assert diffs["stale_downgrade"].python is True
+
+    def test_route_inventory_report_shadow_survives_python_error(
+        self, routing_raw_data, routing_filters, monkeypatch
+    ):
+        legacy = _recorded_baseline(routing_raw_data, routing_filters)
+        monkeypatch.setattr(inventory_service, "generate_inventory_report", _fail_if_called)
+
+        routed = route_inventory_report(
+            routing_raw_data, routing_filters,
+            legacy_handler=lambda *_: legacy,
+            env={"FF_INVENTORY_REPORT_MODE": "shadow"},
+        )
+
+        assert routed.result is legacy
+        assert "python path called" in routed.diff.python_error
+
+    def test_route_inventory_report_python_mode_returns_python_result(
+        self, routing_raw_data, routing_filters
+    ):
+        routed = route_inventory_report(
+            routing_raw_data, routing_filters,
+            legacy_handler=_fail_if_called,
+            env={"FF_INVENTORY_REPORT_MODE": "python"},
+        )
+
+        assert routed.served_by == "python"
+        assert routed.result.total_items == 3
+
+    def test_route_inventory_report_targets_only_cohort_plants(self, routing_raw_data):
+        config = {"inventory_report": {"rules": [{"mode": "python", "match": {"werks": ["1000"]}}]}}
+        legacy = _recorded_baseline(routing_raw_data, InventoryFilters())
+
+        canary = route_inventory_report(
+            routing_raw_data, InventoryFilters(plants=["1000"]), flags_config=config
+        )
+        mixed = route_inventory_report(
+            routing_raw_data, InventoryFilters(plants=["1000", "2000"]),
+            legacy_handler=lambda *_: legacy, flags_config=config,
+        )
+
+        assert canary.served_by == "python"
+        assert mixed.served_by == "abap"
+
+    def test_route_inventory_report_requires_legacy_handler(self, routing_raw_data, routing_filters):
+        with pytest.raises(LegacyHandlerRequired):
+            route_inventory_report(routing_raw_data, routing_filters, env={})
+
+
+def _fail_if_called(*_args, **_kwargs):
+    raise AssertionError("python path called")

@@ -14,8 +14,18 @@ Migration notes:
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
+from ..feature_flags import (
+    INVENTORY_REPORT,
+    FieldDiff,
+    InventoryReportFlagMode,
+    LegacyHandlerRequired,
+    RoutedResult,
+    ShadowDiff,
+    emit_flag_event,
+    resolve_flag,
+)
 from .models import (
     InventoryFilters,
     InventoryItem,
@@ -191,3 +201,99 @@ def generate_inventory_report(
         summary=summary,
         items=items,
     )
+
+
+# ---------------------------------------------------------------------------
+# Feature-flag routing (ABAP → shadow → Python)
+# ---------------------------------------------------------------------------
+
+# Legacy path: calls Z_INVENTORY_REPORT (or replays a recorded ALV baseline).
+InventoryLegacyHandler = Callable[[list[dict], InventoryFilters], InventoryReportResponse]
+
+# ABAP stores the percentage in a packed field with 2 decimals.
+_PCT_PRECISION = Decimal("0.01")
+
+
+def is_stale_downgrade(item: InventoryItem) -> bool:
+    """True when the item is yellow only because of the stale-receipt override."""
+    if item.stock_status != StockStatus.WARNING:
+        return False
+    if item.reorder_point > 0 and item.available_stock < item.reorder_point * Decimal("1.5"):
+        return False
+    return True
+
+
+def diff_inventory_reports(
+    legacy: InventoryReportResponse, python: InventoryReportResponse
+) -> ShadowDiff:
+    """Compare stock_status, stock_percentage and stale downgrades per item."""
+    diff = ShadowDiff()
+
+    def by_key(report: InventoryReportResponse) -> dict[str, InventoryItem]:
+        return {
+            f"{i.material_number}/{i.plant}/{i.storage_location}": i for i in report.items
+        }
+
+    legacy_items, python_items = by_key(legacy), by_key(python)
+    for key in sorted(legacy_items.keys() | python_items.keys()):
+        old, new = legacy_items.get(key), python_items.get(key)
+        if old is None or new is None:
+            diff.differences.append(
+                FieldDiff(key, "present", old is not None, new is not None)
+            )
+            continue
+        if old.stock_status != new.stock_status:
+            diff.differences.append(
+                FieldDiff(key, "stock_status", old.stock_status.value, new.stock_status.value)
+            )
+        old_pct = old.stock_percentage.quantize(_PCT_PRECISION)
+        new_pct = new.stock_percentage.quantize(_PCT_PRECISION)
+        if old_pct != new_pct:
+            diff.differences.append(FieldDiff(key, "stock_percentage", old_pct, new_pct))
+        if is_stale_downgrade(old) != is_stale_downgrade(new):
+            diff.differences.append(
+                FieldDiff(key, "stale_downgrade", is_stale_downgrade(old), is_stale_downgrade(new))
+            )
+    return diff
+
+
+def route_inventory_report(
+    raw_data: list[dict],
+    filters: InventoryFilters,
+    *,
+    legacy_handler: Optional[InventoryLegacyHandler] = None,
+    bukrs: Optional[str] = None,
+    flags_config: Optional[dict] = None,
+    env: Optional[dict] = None,
+) -> RoutedResult[InventoryReportResponse]:
+    """Serve the report from ABAP or Python according to the inventory_report flag.
+
+    Targeting: ``werks`` (all requested plants must be in the cohort) and ``bukrs``.
+    SHADOW runs both paths, logs the diff and returns the legacy result.
+    """
+    attributes = {"werks": filters.plants, "bukrs": bukrs}
+    decision = resolve_flag(
+        INVENTORY_REPORT,
+        {k: v for k, v in attributes.items() if v},
+        config=flags_config,
+        env=env,
+    )
+
+    if decision.mode == InventoryReportFlagMode.PYTHON:
+        routed = RoutedResult(generate_inventory_report(raw_data, filters), decision, "python")
+    else:
+        if legacy_handler is None:
+            raise LegacyHandlerRequired(INVENTORY_REPORT, decision.mode)
+        legacy_result = legacy_handler(raw_data, filters)
+        diff = None
+        if decision.mode == InventoryReportFlagMode.SHADOW:
+            try:
+                diff = diff_inventory_reports(
+                    legacy_result, generate_inventory_report(raw_data, filters)
+                )
+            except Exception as exc:  # shadow path must never break the legacy path
+                diff = ShadowDiff(python_error=repr(exc))
+        routed = RoutedResult(legacy_result, decision, "abap", diff)
+
+    emit_flag_event(routed)
+    return routed

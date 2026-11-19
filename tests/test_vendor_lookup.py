@@ -7,9 +7,11 @@ function module and the migrated Python implementation.
 
 from datetime import date, timedelta
 from decimal import Decimal
+import logging
 
 import pytest
 
+from python_target.feature_flags import LegacyHandlerRequired, VendorLookupFlagMode
 from python_target.vendor_lookup.models import (
     PurchaseOrderItem,
     VendorLookupRequest,
@@ -19,6 +21,7 @@ from python_target.vendor_lookup.service import (
     VendorNotFoundError,
     calculate_po_aggregates,
     lookup_vendor,
+    route_vendor_lookup,
 )
 
 
@@ -227,3 +230,154 @@ class TestLookupVendor:
 
         assert response.vendor.is_blocked is True
         assert response.return_code == 0
+
+
+# ---------------------------------------------------------------------------
+# route_vendor_lookup — feature-flag routing (abap → shadow → python)
+# ---------------------------------------------------------------------------
+
+SHADOW_ENV = {"FF_VENDOR_LOOKUP_MODE": "shadow"}
+
+
+def _fail_if_called(*_args, **_kwargs):
+    raise AssertionError("path should not be called")
+
+
+class TestRouteVendorLookup:
+
+    def test_route_vendor_lookup_defaults_to_abap(self, sample_vendor_data, sample_po_data):
+        request = VendorLookupRequest(vendor_number="0000001000")
+        legacy = lookup_vendor(request, sample_vendor_data, sample_po_data)
+
+        routed = route_vendor_lookup(
+            request, None, [], legacy_handler=lambda _req: legacy, env={}
+        )
+
+        assert routed.decision.mode == VendorLookupFlagMode.ABAP
+        assert routed.result is legacy
+        assert routed.diff is None
+
+    def test_route_vendor_lookup_shadow_returns_legacy_and_diffs_es_vendor(
+        self, sample_vendor_data, sample_po_data, caplog
+    ):
+        request = VendorLookupRequest(vendor_number="0000001000")
+        legacy = lookup_vendor(request, sample_vendor_data, sample_po_data)
+        legacy.vendor.payment_terms = "ZB14"
+        legacy.po_history[0].net_price = Decimal("26.00")
+
+        with caplog.at_level(logging.INFO, logger="python_target.feature_flags"):
+            routed = route_vendor_lookup(
+                request, sample_vendor_data, sample_po_data,
+                legacy_handler=lambda _req: legacy, env=SHADOW_ENV,
+            )
+
+        assert routed.result is legacy
+        fields = {(d.key, d.field) for d in routed.diff.differences}
+        assert ("ES_VENDOR", "payment_terms") in fields
+        assert ("ET_PO_HISTORY/4500001234/00010", "net_price") in fields
+        assert caplog.records[-1].flag_event["diff"]["clean"] is False
+
+    def test_route_vendor_lookup_shadow_clean_when_paths_agree(
+        self, sample_vendor_data, sample_po_data
+    ):
+        request = VendorLookupRequest(vendor_number="0000001000")
+        routed = route_vendor_lookup(
+            request, sample_vendor_data, sample_po_data,
+            legacy_handler=lambda req: lookup_vendor(req, sample_vendor_data, sample_po_data),
+            env=SHADOW_ENV,
+        )
+
+        assert routed.diff.clean
+        assert routed.details["return_code"] == 0
+
+    def test_route_vendor_lookup_shadow_vendor_not_found_reraises_legacy(self, caplog):
+        request = VendorLookupRequest(vendor_number="9999999999")
+
+        def legacy(req):
+            raise VendorNotFoundError(req.vendor_number)
+
+        with caplog.at_level(logging.INFO, logger="python_target.feature_flags"):
+            with pytest.raises(VendorNotFoundError):
+                route_vendor_lookup(request, None, [], legacy_handler=legacy, env=SHADOW_ENV)
+
+        event = caplog.records[-1].flag_event
+        assert event["diff"]["clean"] is True
+        assert event["return_code"] == 1
+
+    def test_route_vendor_lookup_shadow_detects_authorization_failed_mismatch(
+        self, sample_vendor_data, sample_po_data, caplog
+    ):
+        request = VendorLookupRequest(vendor_number="0000001000", company_code="2000")
+
+        def legacy(req):
+            raise AuthorizationError(req.company_code)
+
+        with caplog.at_level(logging.INFO, logger="python_target.feature_flags"):
+            with pytest.raises(AuthorizationError):
+                route_vendor_lookup(
+                    request, sample_vendor_data, sample_po_data,
+                    legacy_handler=legacy, auth_check=lambda _bukrs: True, env=SHADOW_ENV,
+                )
+
+        diffs = caplog.records[-1].flag_event["diff"]["differences"]
+        rc = next(d for d in diffs if d["field"] == "return_code")
+        assert (rc["legacy"], rc["python"]) == (2, 0)
+
+    def test_route_vendor_lookup_shadow_authorization_failed_matches(
+        self, sample_vendor_data, sample_po_data, caplog
+    ):
+        request = VendorLookupRequest(vendor_number="0000001000", company_code="2000")
+
+        def legacy(req):
+            raise AuthorizationError(req.company_code)
+
+        with caplog.at_level(logging.INFO, logger="python_target.feature_flags"):
+            with pytest.raises(AuthorizationError):
+                route_vendor_lookup(
+                    request, sample_vendor_data, sample_po_data,
+                    legacy_handler=legacy, auth_check=lambda bukrs: bukrs == "1000",
+                    env=SHADOW_ENV,
+                )
+
+        assert caplog.records[-1].flag_event["diff"]["clean"] is True
+
+    def test_route_vendor_lookup_python_mode_returns_python_result(
+        self, sample_vendor_data, sample_po_data
+    ):
+        request = VendorLookupRequest(vendor_number="0000001000")
+        routed = route_vendor_lookup(
+            request, sample_vendor_data, sample_po_data,
+            legacy_handler=_fail_if_called, env={"FF_VENDOR_LOOKUP_MODE": "python"},
+        )
+
+        assert routed.served_by == "python"
+        assert routed.result.return_code == 0
+        assert len(routed.result.po_history) == 3
+
+    def test_route_vendor_lookup_targets_bukrs_lifnr_cohort(
+        self, sample_vendor_data, sample_po_data
+    ):
+        env = {
+            "FF_VENDOR_LOOKUP_MODE": "python",
+            "FF_VENDOR_LOOKUP_BUKRS": "1000",
+            "FF_VENDOR_LOOKUP_LIFNR": "0000001000",
+        }
+        legacy = lookup_vendor(
+            VendorLookupRequest(vendor_number="0000001000"), sample_vendor_data, sample_po_data
+        )
+
+        canary = route_vendor_lookup(
+            VendorLookupRequest(vendor_number="0000001000", company_code="1000"),
+            sample_vendor_data, sample_po_data, env=env,
+        )
+        other_bukrs = route_vendor_lookup(
+            VendorLookupRequest(vendor_number="0000001000", company_code="2000"),
+            sample_vendor_data, sample_po_data, legacy_handler=lambda _req: legacy, env=env,
+        )
+
+        assert canary.served_by == "python"
+        assert other_bukrs.served_by == "abap"
+
+    def test_route_vendor_lookup_requires_legacy_handler(self):
+        with pytest.raises(LegacyHandlerRequired):
+            route_vendor_lookup(VendorLookupRequest(vendor_number="1"), None, [], env={})

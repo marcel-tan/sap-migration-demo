@@ -7,22 +7,28 @@ function module and the migrated Python implementation.
 
 from datetime import date
 from decimal import Decimal
+import logging
 
 import pytest
 
+from python_target.feature_flags import OrderSyncFlagMode
 from python_target.order_sync.models import (
     InboundOrderMessage,
     OrderHeader,
     OrderItem,
     OrderPartner,
     OrderStatus,
+    OrderSyncResult,
     PartnerRole,
 )
 from python_target.order_sync.service import (
+    InMemoryIdempotencyStore,
     OrderValidationError,
     parse_idoc_to_order,
     process_order_batch,
     process_single_order,
+    route_inbound_idoc,
+    route_order_message,
     validate_order,
 )
 
@@ -292,3 +298,179 @@ class TestProcessOrderBatch:
         assert batch_result.total_processed == 0
         assert batch_result.successful == 0
         assert batch_result.failed == 0
+
+
+# ---------------------------------------------------------------------------
+# route_order_message — feature-flag routing (idoc_abap → validate_only → python)
+# ---------------------------------------------------------------------------
+
+VALIDATE_ONLY_ENV = {"FF_ORDER_SYNC_MODE": "validate_only"}
+PYTHON_ENV = {"FF_ORDER_SYNC_MODE": "python"}
+
+
+class _Recorder:
+    """Callable stub that counts calls — stands in for ABAP inbound / order create."""
+
+    def __init__(self, returns):
+        self.calls = 0
+        self._returns = returns
+
+    def __call__(self, arg):
+        self.calls += 1
+        return self._returns(arg) if callable(self._returns) else self._returns
+
+
+def _abap_created(message):
+    return OrderSyncResult(
+        message_id=message.message_id, status=OrderStatus.CREATED, order_number="0000012345"
+    )
+
+
+class TestRouteOrderMessage:
+
+    def test_route_order_message_defaults_to_idoc_abap(self, valid_message):
+        legacy, creator = _Recorder(_abap_created), _Recorder("0000099999")
+
+        routed = route_order_message(
+            valid_message, legacy_handler=legacy, order_creator=creator,
+            idempotency_store=InMemoryIdempotencyStore(), env={},
+        )
+
+        assert routed.decision.mode == OrderSyncFlagMode.IDOC_ABAP
+        assert routed.result.order_number == "0000012345"
+        assert (legacy.calls, creator.calls) == (1, 0)
+
+    def test_route_order_message_validate_only_does_not_create_order(self, valid_message, caplog):
+        legacy, creator = _Recorder(_abap_created), _Recorder("0000099999")
+
+        with caplog.at_level(logging.INFO, logger="python_target.feature_flags"):
+            routed = route_order_message(
+                valid_message, legacy_handler=legacy, order_creator=creator,
+                idempotency_store=InMemoryIdempotencyStore(), env=VALIDATE_ONLY_ENV,
+            )
+
+        assert creator.calls == 0
+        assert routed.served_by == "abap"
+        assert routed.result.order_number == "0000012345"
+        assert routed.diff.clean
+        event = caplog.records[-1].flag_event
+        assert event["mode"] == "validate_only"
+        assert event["would_have"]["action"] == "create_order"
+        assert event["would_have"]["item_count"] == 2
+
+    def test_route_order_message_validate_only_records_rejection_diff(self, valid_message):
+        valid_message.order.sold_to_party = ""
+        creator = _Recorder("0000099999")
+
+        routed = route_order_message(
+            valid_message, legacy_handler=_abap_created, order_creator=creator,
+            idempotency_store=InMemoryIdempotencyStore(), env=VALIDATE_ONLY_ENV,
+        )
+
+        assert creator.calls == 0
+        assert routed.details["would_have"]["action"] == "reject"
+        assert routed.details["would_have"]["idoc_status"] == "51"
+        diff = routed.diff.differences[0]
+        assert (diff.field, diff.legacy, diff.python) == ("idoc_status", "53", "51")
+
+    def test_route_order_message_python_mode_creates_order(self, valid_message):
+        legacy, creator = _Recorder(_abap_created), _Recorder("0000099999")
+
+        routed = route_order_message(
+            valid_message, legacy_handler=legacy, order_creator=creator,
+            idempotency_store=InMemoryIdempotencyStore(), env=PYTHON_ENV,
+        )
+
+        assert routed.served_by == "python"
+        assert routed.result.order_number == "0000099999"
+        assert routed.details["idoc_status"] == "53"
+        assert (legacy.calls, creator.calls) == (0, 1)
+
+    def test_route_order_message_replay_same_docnum_is_idempotent(self, valid_message):
+        store, creator = InMemoryIdempotencyStore(), _Recorder("0000099999")
+
+        first = route_order_message(
+            valid_message, order_creator=creator, idempotency_store=store, env=PYTHON_ENV
+        )
+        replay = route_order_message(
+            valid_message, order_creator=creator, idempotency_store=store, env=PYTHON_ENV
+        )
+
+        assert creator.calls == 1
+        assert replay.served_by == "idempotency_store"
+        assert replay.details["replayed"] is True
+        assert replay.result.order_number == first.result.order_number
+
+    def test_route_order_message_flag_flip_after_abap_create_does_not_duplicate(self, valid_message):
+        store, creator = InMemoryIdempotencyStore(), _Recorder("0000099999")
+
+        route_order_message(
+            valid_message, legacy_handler=_abap_created, idempotency_store=store,
+            env=VALIDATE_ONLY_ENV,
+        )
+        flipped = route_order_message(
+            valid_message, order_creator=creator, idempotency_store=store, env=PYTHON_ENV
+        )
+
+        assert creator.calls == 0
+        assert flipped.result.order_number == "0000012345"
+
+    def test_route_order_message_failed_idoc_can_be_reprocessed(self, valid_message):
+        store, creator = InMemoryIdempotencyStore(), _Recorder("0000099999")
+        sold_to = valid_message.order.sold_to_party
+        valid_message.order.sold_to_party = ""
+
+        failed = route_order_message(
+            valid_message, order_creator=creator, idempotency_store=store, env=PYTHON_ENV
+        )
+        valid_message.order.sold_to_party = sold_to
+        retried = route_order_message(
+            valid_message, order_creator=creator, idempotency_store=store, env=PYTHON_ENV
+        )
+
+        assert failed.details["idoc_status"] == "51"
+        assert retried.result.status == OrderStatus.CREATED
+        assert creator.calls == 1
+
+    def test_route_order_message_targets_docnum_cohort(self, valid_order):
+        config = {"order_sync": {"rules": [{"mode": "python", "match": {"docnum": ["0000000042"]}}]}}
+        store, creator = InMemoryIdempotencyStore(), _Recorder("0000099999")
+        canary = InboundOrderMessage(message_id="0000000042", order=valid_order)
+        other = InboundOrderMessage(message_id="0000000043", order=valid_order)
+
+        routed_canary = route_order_message(
+            canary, order_creator=creator, idempotency_store=store, flags_config=config
+        )
+        routed_other = route_order_message(
+            other, legacy_handler=_abap_created, order_creator=creator,
+            idempotency_store=store, flags_config=config,
+        )
+
+        assert routed_canary.served_by == "python"
+        assert routed_other.served_by == "abap"
+        assert creator.calls == 1
+
+    def test_route_order_message_targets_sender_partner(self, valid_message):
+        env = {"FF_ORDER_SYNC_MODE": "python", "FF_ORDER_SYNC_SNDPRN": "EDI-GATEWAY"}
+        routed = route_order_message(
+            valid_message, order_creator=_Recorder("0000099999"),
+            idempotency_store=InMemoryIdempotencyStore(), env=env,
+        )
+        assert routed.served_by == "python"
+
+
+class TestRouteInboundIdoc:
+
+    def test_route_inbound_idoc_validate_only_parses_segments(self, sample_idoc_segments):
+        creator = _Recorder("0000099999")
+
+        routed = route_inbound_idoc(
+            "0000000777", sample_idoc_segments, sender_partner="EDI-GATEWAY",
+            legacy_handler=_abap_created, order_creator=creator,
+            idempotency_store=InMemoryIdempotencyStore(), env=VALIDATE_ONLY_ENV,
+        )
+
+        assert creator.calls == 0
+        assert routed.decision.attributes["kunnr"] == "CUST-001"
+        assert routed.details["would_have"]["item_count"] == 2
+        assert routed.diff.clean

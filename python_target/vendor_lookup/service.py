@@ -12,10 +12,21 @@ Migration notes:
 - BAPI-style return code → HTTP status codes + response body
 """
 
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Callable, Optional
 
+from ..feature_flags import (
+    VENDOR_LOOKUP,
+    FieldDiff,
+    LegacyHandlerRequired,
+    RoutedResult,
+    ShadowDiff,
+    VendorLookupFlagMode,
+    emit_flag_event,
+    resolve_flag,
+)
 from .models import (
     PurchaseOrderItem,
     VendorDetail,
@@ -150,3 +161,129 @@ def lookup_vendor(
             f"{len(po_items)} PO items returned."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Feature-flag routing (ABAP RFC → shadow → Python)
+# ---------------------------------------------------------------------------
+
+# Legacy path: calls Z_RFC_VENDOR_LOOKUP (or replays a recorded response).
+# Raises VendorNotFoundError / AuthorizationError like the RFC exceptions.
+VendorLegacyHandler = Callable[[VendorLookupRequest], VendorLookupResponse]
+
+# Python-side stand-in for AUTHORITY-CHECK OBJECT 'F_LFA1_BUK'.
+AuthCheck = Callable[[str], bool]
+
+RC_OK, RC_NOT_FOUND, RC_AUTH_FAILED = 0, 1, 2
+
+
+@dataclass
+class _VendorOutcome:
+    """Normalized RFC outcome: ES_VENDOR, ET_PO_HISTORY, return code/message."""
+
+    return_code: int
+    return_message: str
+    vendor: Optional[dict[str, Any]] = None
+    po_history: list[dict[str, Any]] = field(default_factory=list)
+    exception: Optional[Exception] = None
+    response: Optional[VendorLookupResponse] = None
+
+
+def _capture(call: Callable[[], VendorLookupResponse]) -> _VendorOutcome:
+    try:
+        response = call()
+    except VendorNotFoundError as exc:
+        return _VendorOutcome(RC_NOT_FOUND, str(exc), exception=exc)
+    except AuthorizationError as exc:
+        return _VendorOutcome(RC_AUTH_FAILED, str(exc), exception=exc)
+    return _VendorOutcome(
+        response.return_code,
+        response.return_message,
+        vendor=response.vendor.model_dump(),
+        po_history=[po.model_dump() for po in response.po_history],
+        response=response,
+    )
+
+
+def diff_vendor_outcomes(legacy: _VendorOutcome, python: _VendorOutcome) -> ShadowDiff:
+    """Compare return code/message, ES_VENDOR fields and ET_PO_HISTORY rows."""
+    diff = ShadowDiff()
+    for name in ("return_code", "return_message"):
+        if getattr(legacy, name) != getattr(python, name):
+            diff.differences.append(
+                FieldDiff("RETURN", name, getattr(legacy, name), getattr(python, name))
+            )
+
+    old_vendor, new_vendor = legacy.vendor or {}, python.vendor or {}
+    for name in sorted(old_vendor.keys() | new_vendor.keys()):
+        if old_vendor.get(name) != new_vendor.get(name):
+            diff.differences.append(
+                FieldDiff("ES_VENDOR", name, old_vendor.get(name), new_vendor.get(name))
+            )
+
+    def by_key(rows: list[dict]) -> dict[str, dict]:
+        return {f"{r['po_number']}/{r['po_item']}": r for r in rows}
+
+    old_pos, new_pos = by_key(legacy.po_history), by_key(python.po_history)
+    for key in sorted(old_pos.keys() | new_pos.keys()):
+        old, new = old_pos.get(key), new_pos.get(key)
+        if old is None or new is None:
+            diff.differences.append(
+                FieldDiff(f"ET_PO_HISTORY/{key}", "present", old is not None, new is not None)
+            )
+            continue
+        for name in sorted(old.keys() | new.keys()):
+            if old.get(name) != new.get(name):
+                diff.differences.append(
+                    FieldDiff(f"ET_PO_HISTORY/{key}", name, old.get(name), new.get(name))
+                )
+    return diff
+
+
+def route_vendor_lookup(
+    request: VendorLookupRequest,
+    vendor_data: Optional[dict],
+    po_data: list[dict],
+    *,
+    legacy_handler: Optional[VendorLegacyHandler] = None,
+    auth_check: Optional[AuthCheck] = None,
+    flags_config: Optional[dict] = None,
+    env: Optional[dict] = None,
+) -> RoutedResult[VendorLookupResponse]:
+    """Serve the lookup from the RFC or Python according to the vendor_lookup flag.
+
+    Targeting: ``bukrs`` (company code) and ``lifnr`` (vendor number).
+    SHADOW runs both paths, logs the diff and returns (or re-raises) the legacy outcome.
+    """
+    decision = resolve_flag(
+        VENDOR_LOOKUP,
+        {"bukrs": request.company_code, "lifnr": request.vendor_number},
+        config=flags_config,
+        env=env,
+    )
+
+    def python_path() -> VendorLookupResponse:
+        if auth_check is not None and not auth_check(request.company_code):
+            raise AuthorizationError(request.company_code)
+        return lookup_vendor(request, vendor_data, po_data)
+
+    if decision.mode == VendorLookupFlagMode.PYTHON:
+        outcome, served_by, diff = _capture(python_path), "python", None
+    else:
+        if legacy_handler is None:
+            raise LegacyHandlerRequired(VENDOR_LOOKUP, decision.mode)
+        outcome, served_by, diff = _capture(lambda: legacy_handler(request)), "abap", None
+        if decision.mode == VendorLookupFlagMode.SHADOW:
+            try:
+                diff = diff_vendor_outcomes(outcome, _capture(python_path))
+            except Exception as exc:  # shadow path must never break the legacy path
+                diff = ShadowDiff(python_error=repr(exc))
+
+    routed = RoutedResult(
+        outcome.response, decision, served_by, diff,
+        details={"return_code": outcome.return_code},
+    )
+    emit_flag_event(routed)
+    if outcome.exception is not None:
+        raise outcome.exception
+    return routed
