@@ -41,6 +41,14 @@ sap-migration-demo/
 │       ├── models.py
 │       └── service.py
 │
+├── cap_target/                         ← SAP CAP (Node.js) variant
+│   └── inventory_report/
+│       ├── db/schema.cds               ← MARA/MAKT/MARC/MARD/MSEG/MKPF entities
+│       ├── db/data/*.csv               ← Sample data (runs standalone on SQLite)
+│       ├── srv/service.cds             ← InventoryService + generateReport action
+│       ├── srv/service.js              ← Business logic (from ABAP FORMs)
+│       └── tests/inventory_report.test.js
+│
 └── tests/                              ← Functional equivalence tests
     ├── test_inventory_report.py
     ├── test_vendor_lookup.py
@@ -62,6 +70,29 @@ sap-migration-demo/
 | **Lines** | ~210 ABAP | ~160 Python |
 
 **What Devin did**: Translated the selection screen to `InventoryFilters` (Pydantic model), replicated the traffic-light calculation with identical thresholds (stock ≤ 0 → red, stock < reorder → red, stock < 1.5× reorder → yellow, else green), and replaced ALV grid output with a structured JSON response that includes an aggregated summary the original report didn't have.
+
+#### CAP / Node.js variant
+
+The same report is also migrated to an [SAP Cloud Application Programming Model](https://cap.cloud.sap) service in `cap_target/inventory_report/`, for teams moving custom code to BTP instead of a standalone Python service.
+
+| ABAP | CAP |
+|---|---|
+| MARA, MAKT, MARC, MARD, MSEG, MKPF | CDS entities in `db/schema.cds` (original field names) |
+| `SELECT ... INNER JOIN ...` (FORM `fetch_inventory_data`) | `InventoryItems` view + CQL `MAX(budat)` receipt query in `srv/service.js` |
+| Selection screen (`s_werks`, `s_lgort`, `s_matkl`, `s_mtart`, `p_stale`, `p_red/yellow/green`) | `generateReport` action parameters (`plants`, `storageLocations`, `materialGroups`, `materialTypes`, `staleDays`, `showCritical/Warning/Healthy`) |
+| FORMs `calculate_stock_status`, `filter_by_status` | Same thresholds in `srv/service.js`, with comments mapping to each FORM |
+| ALV grid (FORM `display_alv`) | JSON result sorted by status then plant, plus the Python `InventoryReportSummary` |
+
+```bash
+cd cap_target/inventory_report
+npm install
+npm test        # Jest + cds.test
+npm run watch   # http://localhost:4004, in-memory SQLite with sample data
+curl -X POST localhost:4004/odata/v4/inventory/generateReport \
+  -H 'Content-Type: application/json' -d '{"plants":["1000"],"showHealthy":true}'
+```
+
+Differences from the Python service: `stale_materials` is computed (it is always 0 in Python), and the select-options accept value lists only (no ABAP ranges/patterns).
 
 ### 2. Vendor Lookup — RFC Function Module → REST API
 
@@ -96,6 +127,8 @@ cd sap-migration-demo
 pip install -r requirements.txt
 pytest tests/ -v
 ```
+
+For the CAP variant, run `npm test` in `cap_target/inventory_report/`.
 
 Expected output: **25+ tests passing**, covering:
 - Stock status calculation (all threshold boundaries)

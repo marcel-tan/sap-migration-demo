@@ -1,0 +1,36 @@
+{
+  "name": "inventory-report",
+  "version": "1.0.0",
+  "description": "CAP Node.js migration of the ABAP ALV report Z_INVENTORY_REPORT",
+  "private": true,
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@cap-js/sqlite": "^3",
+    "@sap/cds": "^10"
+  },
+  "devDependencies": {
+    "@cap-js/cds-test": "^1",
+    "@sap/cds-dk": "^10",
+    "jest": "^29"
+  },
+  "scripts": {
+    "start": "cds-serve",
+    "serve": "cds serve all --in-memory",
+    "watch": "cds watch",
+    "test": "jest"
+  },
+  "cds": {
+    "requires": {
+      "db": {
+        "kind": "sqlite",
+        "credentials": {
+          "url": ":memory:"
+        }
+      }
+    }
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testTimeout": 30000
+  }
+}
