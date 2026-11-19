@@ -210,6 +210,13 @@ class TestParseIdocToOrder:
         assert order.requested_delivery_date == date(2024, 7, 1)
         assert order.customer_po_date == date(2024, 6, 15)
 
+    def test_parse_idoc_to_order_initial_date_is_none(self):
+        order = parse_idoc_to_order([
+            {"segment_type": "E1EDK03", "IDDAT": "012", "DATUM": "00000000"}
+        ])
+
+        assert order.requested_delivery_date is None
+
     def test_partner_parsing(self, sample_idoc_segments):
         """ABAP: WHEN 'E1EDKA1' → sold-to (AG), ship-to (WE)."""
         order = parse_idoc_to_order(sample_idoc_segments)
@@ -460,6 +467,23 @@ class TestRouteOrderMessage:
 
 
 class TestRouteInboundIdoc:
+
+    def test_route_inbound_idoc_initial_date_calls_legacy_handler(self, sample_idoc_segments):
+        raw_segments = [segment.copy() for segment in sample_idoc_segments]
+        next(segment for segment in raw_segments if segment.get("IDDAT") == "012")[
+            "DATUM"
+        ] = "00000000"
+        legacy = _Recorder(_abap_created)
+
+        routed = route_inbound_idoc(
+            "0000000778", raw_segments, sender_partner="EDI-GATEWAY",
+            legacy_handler=legacy,
+            idempotency_store=InMemoryIdempotencyStore(),
+        )
+
+        assert legacy.calls == 1
+        assert routed.served_by == "abap"
+        assert routed.result.order_number == "0000012345"
 
     def test_route_inbound_idoc_validate_only_parses_segments(self, sample_idoc_segments):
         creator = _Recorder("0000099999")

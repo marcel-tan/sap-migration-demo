@@ -137,8 +137,8 @@ def parse_idoc_to_order(raw_segments: list[dict]) -> OrderHeader:
         elif seg_type == "E1EDK03":
             qualifier = seg.get("IDDAT", "")
             date_val = seg.get("DATUM")
-            if date_val and isinstance(date_val, str):
-                date_val = date.fromisoformat(date_val)
+            if isinstance(date_val, str):
+                date_val = None if not date_val.strip("0") else date.fromisoformat(date_val)
             if qualifier == "012":
                 header.requested_delivery_date = date_val
             elif qualifier == "022":
